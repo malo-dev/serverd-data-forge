@@ -255,6 +255,15 @@ io.on('connection', (socket) => {
           }
         }),
       })),
+      // Every socket currently connected to the relay, whether or not it's sitting in a
+      // tunnel — so the admin can see people who just have the app open, not in a session.
+      allConnections: [...io.sockets.sockets.values()].map((s) => ({
+        socketId: s.id,
+        ip: s.data.ip || 'unknown',
+        roomCode: s.data.roomCode || null,
+        isAdmin: Boolean(s.data.isAdmin),
+        reqPerSec: requestRate(s),
+      })),
     }
   }
 
