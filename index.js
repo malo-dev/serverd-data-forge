@@ -30,7 +30,10 @@ app.get('/', (_req, res) => res.send('JSON Workbench collab relay is running.'))
 app.get('/health', (_req, res) => res.json({ ok: true, rooms: rooms.size }))
 
 const httpServer = createServer(app)
-const io = new Server(httpServer, { cors: { origin: '*' } })
+// Engine.IO's default maxPayload (~1MB) is far below our own file-share cap (15MB of
+// base64) — without raising it, a large share gets killed at the transport level with
+// an abrupt disconnect, before the 'file-share' handler's own size check ever runs.
+const io = new Server(httpServer, { cors: { origin: '*' }, maxHttpBufferSize: 20 * 1024 * 1024 })
 
 // In-memory only — never persisted to disk. Rooms disappear on expiry or when empty.
 const rooms = new Map() // code -> { members: Set<socketId>, expiresAt: number, timer: NodeJS.Timeout }
