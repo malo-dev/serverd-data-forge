@@ -199,6 +199,7 @@ io.on('connection', (socket) => {
       name: String(file.name || 'file').slice(0, 200),
       mimeType: String(file.mimeType || 'application/octet-stream').slice(0, 100),
       size: Number(file.size) || 0,
+      gzipped: Boolean(file.gzipped),
       dataUrl: file.dataUrl,
       sharedBy: room.names.get(socket.id) || 'Anonymous',
       at: Date.now(),
