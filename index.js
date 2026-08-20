@@ -188,11 +188,12 @@ io.on('connection', (socket) => {
   })
 
   // File is relayed in-memory only, straight through to peers — never written to disk here.
-  socket.on('file-share', (file) => {
+  socket.on('file-share', (file, ack) => {
     const code = socket.data.roomCode
     const room = rooms.get(code)
-    if (!code || !room) return
-    if (!file?.dataUrl || typeof file.dataUrl !== 'string' || file.dataUrl.length > 15 * 1024 * 1024) return
+    if (!code || !room) return ack?.({ ok: false, error: 'You are not in an active tunnel on the server. Try reconnecting.' })
+    if (!file?.dataUrl || typeof file.dataUrl !== 'string') return ack?.({ ok: false, error: 'Invalid file.' })
+    if (file.dataUrl.length > 15 * 1024 * 1024) return ack?.({ ok: false, error: 'File too large.' })
     const shared = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       name: String(file.name || 'file').slice(0, 200),
@@ -204,6 +205,7 @@ io.on('connection', (socket) => {
     }
     io.to(code).emit('file-shared', shared)
     console.log(`[collab] ${socket.id} shared file "${shared.name}" in room ${code}`)
+    ack?.({ ok: true })
   })
 
   socket.on('leave-tunnel', () => {
