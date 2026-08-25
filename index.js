@@ -1,7 +1,34 @@
+/**
+ * Data Forge relay server.
+ *
+ * Everything here is in-memory only — nothing is ever written to disk or a
+ * database. Rooms, devices, and control sessions all disappear on server
+ * restart or when they become empty.
+ *
+ * - Collab relay: browser tabs join a 4-digit tunnel code and get document
+ *   edits, chat, and shared files relayed between them (`rooms`).
+ * - Native agents: a separate presence system (`devices`) for the Data Forge
+ *   Native Agent — a desktop companion that can join the same tunnel code and
+ *   be asked (by a browser tab or another agent) for a remote-control session.
+ *   Every remote-control action requires the target device's explicit,
+ *   per-session consent; approved sessions are tracked in
+ *   `activeControlSessions` and every terminal/mouse/keyboard/screen event is
+ *   routed only between that session's controller and target — never broadcast.
+ * - IP blocking is defense-in-depth: checked at connect, and again on every
+ *   inbound packet via `socket.use`, since a block can land mid-session.
+ * - `maxHttpBufferSize` is raised above Engine.IO's ~1MB default so it doesn't
+ *   silently kill the socket on a file share near our own 15MB cap.
+ */
+
 import express from 'express'
 import cors from 'cors'
 import { createServer } from 'http'
 import { Server } from 'socket.io'
+import path from 'path'
+import { fileURLToPath } from 'url'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const PUBLIC_DIR = path.join(__dirname, 'public')
 
 const PORT = process.env.PORT || 4210
 const ADMIN_KEY = process.env.ADMIN_KEY || ''
@@ -9,8 +36,6 @@ const DEFAULT_TTL_MS = 30 * 60 * 1000 // 30 minutes
 const MIN_TTL_MS = 1 * 60 * 1000 // 1 minute
 const MAX_TTL_MS = 4 * 60 * 60 * 1000 // 4 hours
 
-// In-memory only — cleared on server restart. Blocks apply to the collab relay only,
-// never to loading the app itself (there is no way to IP-block static hosting from here).
 const blockedIps = new Set()
 
 function clientIp(socket) {
@@ -24,10 +49,20 @@ function clampTtlMs(requestedMinutes) {
   return Math.min(MAX_TTL_MS, Math.max(MIN_TTL_MS, ms))
 }
 
+const SERVER_STARTED_AT = Date.now()
+
 const app = express()
 app.use(cors())
-app.get('/', (_req, res) => res.send('JSON Workbench collab relay is running.'))
-app.get('/health', (_req, res) => res.json({ ok: true, rooms: rooms.size }))
+app.use('/static', express.static(path.join(PUBLIC_DIR, 'static')))
+app.get('/', (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'status.html')))
+app.get('/health', (req, res) => {
+  const healthData = { ok: true, rooms: rooms.size, devices: devices.size, uptimeMs: Date.now() - SERVER_STARTED_AT }
+  if (req.accepts(['json', 'html']) === 'html') {
+    res.sendFile(path.join(PUBLIC_DIR, 'health.html'))
+  } else {
+    res.json(healthData)
+  }
+})
 
 const httpServer = createServer(app)
 // Engine.IO's default maxPayload (~1MB) is far below our own file-share cap (15MB of
@@ -37,6 +72,18 @@ const io = new Server(httpServer, { cors: { origin: '*' }, maxHttpBufferSize: 20
 
 // In-memory only — never persisted to disk. Rooms disappear on expiry or when empty.
 const rooms = new Map() // code -> { members: Set<socketId>, expiresAt: number, timer: NodeJS.Timeout }
+
+// Native agents (Data Forge Native Agent), separate from the browser-side collab
+// members above. An agent registers itself here on connect, independent of any
+// tunnel, and additionally joins a room's `devices` set once it's told to join a
+// tunnel by code — that's what lets a browser tab in the same room see it and
+// address a remote-control request to it by deviceId.
+const devices = new Map() // deviceId -> { socketId, hostname, os, osVersion, arch, agentVersion, status, roomCode }
+const pendingControlRequests = new Map() // requestId -> { fromSocketId, toDeviceId, tunnelCode }
+// Populated once a control request is approved, cleared when the session ends —
+// this is what lets terminal/mouse/keyboard/screen events be routed to exactly the
+// controller<->target pair for that session, and rejected from anyone else.
+const activeControlSessions = new Map() // requestId -> { controllerSocketId, targetDeviceId, targetSocketId }
 
 function generateCode() {
   let code
@@ -117,7 +164,7 @@ io.on('connection', (socket) => {
     const ttlMs = clampTtlMs(payload?.ttlMinutes)
     const names = new Map([[socket.id, String(payload?.name || 'Anonymous').slice(0, 24)]])
     const ips = new Map([[socket.id, socket.data.ip]])
-    rooms.set(code, { members: new Set([socket.id]), names, ips, ttlMs, expiresAt: Date.now() + ttlMs })
+    rooms.set(code, { members: new Set([socket.id]), names, ips, deviceIds: new Set(), ttlMs, expiresAt: Date.now() + ttlMs })
     scheduleExpiry(code, ttlMs)
     socket.join(code)
     socket.data.roomCode = code
@@ -218,6 +265,13 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     leaveCurrentRoom(socket)
+    leaveDeviceTunnel(socket)
+    removeDevice(socket)
+    for (const [requestId, session] of activeControlSessions) {
+      if (session.controllerSocketId === socket.id || session.targetSocketId === socket.id) {
+        endControlSession(requestId, 'participant disconnected')
+      }
+    }
   })
 
   function leaveCurrentRoom(socket) {
@@ -229,7 +283,7 @@ io.on('connection', (socket) => {
       room.names.delete(socket.id)
       room.ips.delete(socket.id)
       socket.to(code).emit('peer-left', { peerCount: room.members.size, peerNames: memberList(room) })
-      if (room.members.size === 0) {
+      if (room.members.size === 0 && room.deviceIds.size === 0) {
         clearTimeout(room.timer)
         rooms.delete(code)
         console.log(`[collab] room ${code} closed (empty)`)
@@ -237,6 +291,263 @@ io.on('connection', (socket) => {
     }
     socket.data.roomCode = null
   }
+
+  // --- Native agents (Data Forge Native Agent): presence, tunnel membership, and
+  // remote-control request relaying between a device and either a browser tab or
+  // another device sharing the same tunnel code. ---
+
+  function deviceListForRoom(code) {
+    const room = rooms.get(code)
+    if (!room) return []
+    return [...room.deviceIds]
+      .map((id) => devices.get(id))
+      .filter(Boolean)
+      .map((d) => ({ deviceId: d.deviceId, hostname: d.hostname, os: d.os, arch: d.arch, agentVersion: d.agentVersion, status: d.status }))
+  }
+
+  socket.on('device-register', (payload) => {
+    if (blockedIps.has(socket.data.ip)) return
+    const deviceId = String(payload?.deviceId || '').trim()
+    if (!deviceId) return
+    socket.data.deviceId = deviceId
+    devices.set(deviceId, {
+      deviceId,
+      socketId: socket.id,
+      hostname: String(payload?.hostname || 'unknown').slice(0, 100),
+      os: String(payload?.os || 'unknown').slice(0, 50),
+      osVersion: String(payload?.osVersion || '').slice(0, 100),
+      arch: String(payload?.arch || 'unknown').slice(0, 20),
+      agentVersion: String(payload?.agentVersion || '0.0.0').slice(0, 20),
+      status: 'online',
+      roomCode: null,
+      lastSeen: Date.now(),
+    })
+    console.log(`[agent] device ${deviceId} (${payload?.hostname}) registered`)
+  })
+
+  socket.on('device-heartbeat', (payload) => {
+    const deviceId = socket.data.deviceId || payload?.deviceId
+    const device = deviceId && devices.get(deviceId)
+    if (device) device.lastSeen = Date.now()
+  })
+
+  socket.on('device-join-tunnel', (payload, ack) => {
+    if (blockedIps.has(socket.data.ip)) return ack?.({ ok: false, error: 'Access denied.' })
+    const deviceId = socket.data.deviceId
+    const device = deviceId && devices.get(deviceId)
+    if (!device) return ack?.({ ok: false, error: 'Device not registered yet.' })
+    const code = String(payload?.code || '').trim()
+    const room = rooms.get(code)
+    if (!room) return ack?.({ ok: false, error: 'This code is invalid or has expired.' })
+
+    room.deviceIds.add(deviceId)
+    device.roomCode = code
+    socket.join(code)
+    socket.data.roomCode = code
+    socket.to(code).emit('device-joined', { deviceId, hostname: device.hostname, os: device.os })
+    ack?.({ ok: true, code, expiresAt: room.expiresAt })
+    console.log(`[agent] device ${deviceId} joined tunnel ${code}`)
+  })
+
+  socket.on('device-leave-tunnel', () => {
+    leaveDeviceTunnel(socket)
+  })
+
+  function leaveDeviceTunnel(socket) {
+    const deviceId = socket.data.deviceId
+    const device = deviceId && devices.get(deviceId)
+    if (!device || !device.roomCode) return
+    const code = device.roomCode
+    const room = rooms.get(code)
+    if (room) {
+      room.deviceIds.delete(deviceId)
+      socket.to(code).emit('device-left', { deviceId })
+      if (room.members.size === 0 && room.deviceIds.size === 0) {
+        clearTimeout(room.timer)
+        rooms.delete(code)
+        console.log(`[collab] room ${code} closed (empty)`)
+      }
+    }
+    device.roomCode = null
+  }
+
+  function removeDevice(socket) {
+    const deviceId = socket.data.deviceId
+    if (!deviceId) return
+    devices.delete(deviceId)
+    console.log(`[agent] device ${deviceId} disconnected`)
+  }
+
+  // List devices present in the caller's current tunnel — what JSON-Workbench's UI
+  // calls to populate "machines connected to this tunnel."
+  socket.on('device-list', (_payload, ack) => {
+    const code = socket.data.roomCode
+    if (!code) return ack?.({ ok: false, error: 'You are not in a tunnel.' })
+    ack?.({ ok: true, devices: deviceListForRoom(code) })
+  })
+
+  // A browser tab (or another device) in the tunnel asks to control a specific
+  // device by id. The request is relayed to that device's agent — nothing here
+  // grants control; the target agent's own consent prompt decides.
+  socket.on('device-control-request', (payload, ack) => {
+    const code = socket.data.roomCode
+    if (!code) return ack?.({ ok: false, error: 'You are not in a tunnel.' })
+    const targetDeviceId = String(payload?.deviceId || '').trim()
+    const target = devices.get(targetDeviceId)
+    if (!target || target.roomCode !== code) return ack?.({ ok: false, error: 'That device is not in this tunnel.' })
+
+    const targetSocket = io.sockets.sockets.get(target.socketId)
+    if (!targetSocket) return ack?.({ ok: false, error: 'That device is not reachable right now.' })
+
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+    pendingControlRequests.set(requestId, { fromSocketId: socket.id, toDeviceId: targetDeviceId, tunnelCode: code })
+    targetSocket.emit('device-control-request', {
+      requestId,
+      fromLabel: String(payload?.fromLabel || 'A tunnel participant').slice(0, 100),
+      tunnelCode: code,
+    })
+    ack?.({ ok: true, requestId })
+    console.log(`[agent] control request ${requestId} sent to device ${targetDeviceId} in tunnel ${code}`)
+  })
+
+  // The target agent's own consent decision comes back here, and we relay it to
+  // whoever originally asked. On approval, the pair is promoted into
+  // activeControlSessions so terminal/input/screen events can be routed and
+  // authorized for the lifetime of this specific session.
+  socket.on('device-control-response', (payload) => {
+    const requestId = String(payload?.requestId || '').trim()
+    const pending = pendingControlRequests.get(requestId)
+    if (!pending) return
+    pendingControlRequests.delete(requestId)
+    const approved = Boolean(payload?.approved)
+    if (approved) {
+      activeControlSessions.set(requestId, {
+        controllerSocketId: pending.fromSocketId,
+        targetDeviceId: pending.toDeviceId,
+        targetSocketId: socket.id,
+      })
+    }
+    const requester = io.sockets.sockets.get(pending.fromSocketId)
+    requester?.emit('device-control-response', { requestId, approved, deviceId: pending.toDeviceId })
+    console.log(`[agent] control request ${requestId} ${approved ? 'approved' : 'denied'}`)
+  })
+
+  function endControlSession(requestId, reason) {
+    const session = activeControlSessions.get(requestId)
+    if (!session) return
+    activeControlSessions.delete(requestId)
+    const controller = io.sockets.sockets.get(session.controllerSocketId)
+    const target = io.sockets.sockets.get(session.targetSocketId)
+    controller?.emit('device-control-session-ended', { requestId, reason })
+    target?.emit('device-control-session-ended', { requestId, reason })
+    console.log(`[agent] control session ${requestId} ended (${reason})`)
+  }
+
+  // Either side can end an active session at any time — the controller giving up,
+  // or the target agent's own "Disconnect / Stop Session" control.
+  socket.on('device-control-end', (payload) => {
+    const requestId = String(payload?.requestId || '').trim()
+    const session = activeControlSessions.get(requestId)
+    if (!session) return
+    if (socket.id !== session.controllerSocketId && socket.id !== session.targetSocketId) return
+    endControlSession(requestId, 'ended by participant')
+  })
+
+  function isSessionController(requestId, socketId) {
+    const session = activeControlSessions.get(requestId)
+    return Boolean(session && session.controllerSocketId === socketId)
+  }
+
+  function isSessionTarget(requestId, socketId) {
+    const session = activeControlSessions.get(requestId)
+    return Boolean(session && session.targetSocketId === socketId)
+  }
+
+  // --- Remote terminal: strictly scoped to an active, approved control session.
+  // The controller's shell input is relayed to the target agent, which is the only
+  // thing that ever actually spawns a shell and runs commands. ---
+  socket.on('terminal-input', (payload) => {
+    const requestId = String(payload?.requestId || '').trim()
+    if (!isSessionController(requestId, socket.id)) return
+    const session = activeControlSessions.get(requestId)
+    const target = io.sockets.sockets.get(session.targetSocketId)
+    target?.emit('terminal-input', { requestId, data: String(payload?.data || '') })
+  })
+
+  socket.on('terminal-output', (payload) => {
+    const requestId = String(payload?.requestId || '').trim()
+    if (!isSessionTarget(requestId, socket.id)) return
+    const session = activeControlSessions.get(requestId)
+    const controller = io.sockets.sockets.get(session.controllerSocketId)
+    controller?.emit('terminal-output', { requestId, data: String(payload?.data || '') })
+  })
+
+  socket.on('terminal-resize', (payload) => {
+    const requestId = String(payload?.requestId || '').trim()
+    if (!isSessionController(requestId, socket.id)) return
+    const session = activeControlSessions.get(requestId)
+    const target = io.sockets.sockets.get(session.targetSocketId)
+    const cols = Number(payload?.cols) || 80
+    const rows = Number(payload?.rows) || 24
+    target?.emit('terminal-resize', { requestId, cols, rows })
+  })
+
+  // --- Remote mouse/keyboard: same strict routing as the terminal above — only
+  // the approved controller of an active session can send input, and it's relayed
+  // only to that session's target agent, never broadcast. ---
+  function relayInputEvent(eventName) {
+    socket.on(eventName, (payload) => {
+      const requestId = String(payload?.requestId || '').trim()
+      if (!isSessionController(requestId, socket.id)) return
+      const session = activeControlSessions.get(requestId)
+      const target = io.sockets.sockets.get(session.targetSocketId)
+      target?.emit(eventName, payload)
+    })
+  }
+  relayInputEvent('remote-mouse-move')
+  relayInputEvent('remote-mouse-click')
+  relayInputEvent('remote-mouse-scroll')
+  relayInputEvent('remote-key-press')
+  relayInputEvent('remote-type-text')
+
+  // --- Screen sharing (Socket.IO periodic-JPEG version — see screenCapture.ts on
+  // the agent side; a WebRTC-based version can replace this later without
+  // changing the consent/session model). Controller asks the target to start/stop;
+  // frames flow target -> controller only, strictly scoped to the active session. ---
+  socket.on('screen-share-start', (payload) => {
+    const requestId = String(payload?.requestId || '').trim()
+    if (!isSessionController(requestId, socket.id)) return
+    const session = activeControlSessions.get(requestId)
+    const target = io.sockets.sockets.get(session.targetSocketId)
+    target?.emit('screen-share-start', { requestId })
+  })
+
+  socket.on('screen-share-stop', (payload) => {
+    const requestId = String(payload?.requestId || '').trim()
+    if (!isSessionController(requestId, socket.id)) return
+    const session = activeControlSessions.get(requestId)
+    const target = io.sockets.sockets.get(session.targetSocketId)
+    target?.emit('screen-share-stop', { requestId })
+  })
+
+  socket.on('screen-frame', (payload) => {
+    const requestId = String(payload?.requestId || '').trim()
+    if (!isSessionTarget(requestId, socket.id)) return
+    if (!payload?.dataUrl || typeof payload.dataUrl !== 'string') return
+    // Frames are relayed live, never buffered/stored server-side — same in-memory-
+    // only posture as the rest of this relay. A large-but-bounded cap protects
+    // against a runaway payload without needing per-frame disk or memory tracking.
+    if (payload.dataUrl.length > 4 * 1024 * 1024) return
+    const session = activeControlSessions.get(requestId)
+    const controller = io.sockets.sockets.get(session.controllerSocketId)
+    controller?.emit('screen-frame', {
+      requestId,
+      dataUrl: payload.dataUrl,
+      width: Number(payload.width) || 0,
+      height: Number(payload.height) || 0,
+      capturedAt: Number(payload.capturedAt) || Date.now(),
+    })
+  })
 
   // --- Admin: view active tunnels/IPs, block/unblock IPs from the collab relay ---
   socket.on('admin-auth', (payload, ack) => {

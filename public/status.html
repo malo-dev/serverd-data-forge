@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Data Forge Relay — Status</title>
+<link rel="stylesheet" href="/static/status.css" />
+</head>
+<body>
+<main>
+  <span class="badge">Online</span>
+  <h1>Data Forge Relay</h1>
+  <p class="subtitle">Real-time collaboration relay for JSON Workbench and the Data Forge Native Agent.</p>
+
+  <div class="notice">
+    <strong>Transparency note:</strong> this server is a message relay only. It never
+    stores your documents, files, or screen data on disk — everything here lives in
+    memory for the duration of a session and disappears when that session ends or
+    this server restarts.
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="value" id="stat-rooms">…</div><div class="label">Active tunnels</div></div>
+    <div class="stat"><div class="value" id="stat-devices">…</div><div class="label">Native agents online</div></div>
+    <div class="stat"><div class="value" id="stat-uptime">…</div><div class="label">Uptime</div></div>
+  </div>
+
+  <section>
+    <h2>What this server does</h2>
+    <ul>
+      <li>Relays live JSON Workbench collaboration sessions (document edits, chat, shared files) between browser tabs joined to the same 4-digit tunnel code.</li>
+      <li>Relays presence and remote-control requests for the Data Forge Native Agent, an early-preview desktop companion that lets a tunnel participant ask to control another connected device — only after that device's own user explicitly approves.</li>
+      <li>Nothing is ever written to a database here. A tunnel's data exists only as long as the tunnel is open.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Native Agent — preview status</h2>
+    <p>
+      The remote-control agent (screen sharing, mouse/keyboard, remote terminal) is an
+      <strong>early test build</strong>: unsigned, not yet hardened, and not intended for
+      general distribution. Every remote-control action requires the target device's
+      explicit, per-session consent — nothing runs without it.
+    </p>
+  </section>
+
+  <footer>
+    Health check: <code>/health</code> · This page is served by the relay itself, not JSON Workbench.
+  </footer>
+</main>
+<script src="/static/status.js"></script>
+</body>
+</html>
